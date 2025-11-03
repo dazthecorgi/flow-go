@@ -9,6 +9,12 @@ import (
 	"github.com/onflow/flow-go/model/flow"
 )
 
+// nodeKey uniquely identifies a node, including whether it's a twin
+type nodeKey struct {
+	id     flow.Identifier
+	isTwin bool
+}
+
 // Stopper is responsible for detecting a stopping condition, and stopping all nodes.
 //
 // Design motivation:
@@ -20,7 +26,7 @@ import (
 //     then stop them all - this is what the Stopper does.
 type Stopper struct {
 	sync.Mutex
-	running  map[flow.Identifier]struct{}
+	running  map[nodeKey]struct{}
 	stopping *atomic.Bool
 	// finalizedCount is the number of blocks which must be finalized (by each node)
 	// before the stopFunc is called
@@ -34,7 +40,7 @@ type Stopper struct {
 
 func NewStopper(finalizedCount uint, tolerate int) *Stopper {
 	return &Stopper{
-		running:        make(map[flow.Identifier]struct{}),
+		running:        make(map[nodeKey]struct{}),
 		stopping:       atomic.NewBool(false),
 		finalizedCount: finalizedCount,
 		tolerate:       tolerate,
@@ -45,10 +51,12 @@ func NewStopper(finalizedCount uint, tolerate int) *Stopper {
 // AddNode registers a node with the Stopper, so that the stopping condition is
 // adjusted to account for this node (ie. we will now also wait for the added
 // node to finalize the desired number of blocks).
+// Twin nodes are tracked separately from their original nodes.
 func (s *Stopper) AddNode(n *Node) {
 	s.Lock()
 	defer s.Unlock()
-	s.running[n.id.NodeID] = struct{}{}
+	key := nodeKey{id: n.id.NodeID, isTwin: n.isTwin}
+	s.running[key] = struct{}{}
 }
 
 // WithStopFunc adds a function to use to stop all nodes (typically the cancel function of the context used to start them).
@@ -59,7 +67,7 @@ func (s *Stopper) WithStopFunc(stop func()) {
 
 // onFinalizedTotal is called via CounterConsumer each time a node finalizes a block.
 // When called, the node with ID `id` has finalized `total` blocks.
-func (s *Stopper) onFinalizedTotal(id flow.Identifier, total uint) {
+func (s *Stopper) onFinalizedTotal(node *Node, total uint) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -68,7 +76,10 @@ func (s *Stopper) onFinalizedTotal(id flow.Identifier, total uint) {
 	}
 
 	// keep track of remaining running nodes
-	delete(s.running, id)
+	// Remove both twin and non-twin entries for this ID
+	delete(s.running, nodeKey{id: node.id.NodeID, isTwin: node.isTwin})
+	// fmt.Printf("Node %x (twin: %t) has finalized %d blocks and is considered stopped\n", node.id.NodeID, node.isTwin, total)
+
 
 	// if all the honest nodes have reached the total number of
 	// finalized blocks, then stop all nodes

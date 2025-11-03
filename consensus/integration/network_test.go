@@ -20,17 +20,17 @@ import (
 // It maintains a set of network instances and enables them to directly exchange message
 // over the memory.
 type Hub struct {
-	log        zerolog.Logger
-	networks   map[flow.Identifier]*Network
-	filter     BlockOrDelayFunc
-	identities flow.IdentityList
+	log         zerolog.Logger
+	networks    map[flow.Identifier][]*Network // Support multiple networks per ID
+	filter      BlockOrDelayFunc
+	identities  flow.IdentityList
 }
 
 // NewNetworkHub creates and returns a new Hub instance.
 func NewNetworkHub(log zerolog.Logger) *Hub {
 	return &Hub{
 		log:        log,
-		networks:   make(map[flow.Identifier]*Network),
+		networks:   make(map[flow.Identifier][]*Network),
 		identities: flow.IdentityList{},
 	}
 }
@@ -52,7 +52,7 @@ func (h *Hub) AddNetwork(originID flow.Identifier, node *Node) *Network {
 		conduits: make(map[channels.Channel]*Conduit),
 		node:     node,
 	}
-	h.networks[originID] = net
+	h.networks[originID] = append(h.networks[originID], net)
 	h.identities = append(h.identities, node.id)
 	return net
 }
@@ -128,46 +128,53 @@ func (n *Network) submit(event interface{}, channel channels.Channel, targetIDs 
 // unicast is called when the attached Engine to the channel is sending an event to a single target
 // Engine attached to the same channel on another node.
 func (n *Network) unicast(event interface{}, channel channels.Channel, targetID flow.Identifier) error {
-	net, found := n.hub.networks[targetID]
+	nets, found := n.hub.networks[targetID]
 	if !found {
 		return fmt.Errorf("could not find target network on hub: %x", targetID)
 	}
-	con, found := net.conduits[channel]
-	if !found {
-		return fmt.Errorf("invalid channel (%d) for target ID (%x)", targetID, channel)
-	}
 
-	sender, receiver := n.node, net.node
-	block, delay := n.hub.filter(channel, event, sender, receiver)
-	// block the message
-	if block {
-		return nil
-	}
-
-	// no delay, push to the receiver's message queue right away
-	if delay == 0 {
-		msg, ok := event.(messages.UntrustedMessage)
-		if !ok {
-			return fmt.Errorf("invalid message type: expected messages.UntrustedMessage, got %T", event)
+	// Send to all networks associated with this ID
+	var sendErrors *multierror.Error
+	for _, net := range nets {
+		con, found := net.conduits[channel]
+		if !found {
+			sendErrors = multierror.Append(sendErrors, fmt.Errorf("invalid channel (%s) for target ID (%x)", channel, targetID))
+			continue
 		}
-		con.queue <- message{originID: n.originID, event: msg}
-		return nil
+
+		sender, receiver := n.node, net.node
+		block, delay := n.hub.filter(channel, event, sender, receiver)
+		// block the message
+		if block {
+			continue
+		}
+
+		// no delay, push to the receiver's message queue right away
+		if delay == 0 {
+			msg, ok := event.(messages.UntrustedMessage)
+			if !ok {
+				sendErrors = multierror.Append(sendErrors, fmt.Errorf("invalid message type: expected messages.UntrustedMessage, got %T", event))
+				continue
+			}
+			con.queue <- message{originID: n.originID, event: msg}
+			continue
+		}
+
+		// use a goroutine to wait and send
+		go func(delay time.Duration, senderID flow.Identifier, receiver *Conduit, event interface{}) {
+			// sleep in order to simulate the network delay
+			time.Sleep(delay)
+			msg, ok := event.(messages.UntrustedMessage)
+			if !ok {
+				err := fmt.Errorf("invalid message type: expected messages.UntrustedMessage, got %T", event)
+				n.log.Err(err).Msg("failed to push to the receiver's message queue")
+				return
+			}
+			con.queue <- message{originID: senderID, event: msg}
+		}(delay, n.originID, con, event)
 	}
 
-	// use a goroutine to wait and send
-	go func(delay time.Duration, senderID flow.Identifier, receiver *Conduit, event interface{}) {
-		// sleep in order to simulate the network delay
-		time.Sleep(delay)
-		msg, ok := event.(messages.UntrustedMessage)
-		if !ok {
-			err := fmt.Errorf("invalid message type: expected messages.UntrustedMessage, got %T", event)
-			n.log.Err(err).Msg("failed to push to the receiver's message queue")
-			return
-		}
-		con.queue <- message{originID: senderID, event: msg}
-	}(delay, n.originID, con, event)
-
-	return nil
+	return sendErrors.ErrorOrNil()
 }
 
 // publish is called when the attached Engine is sending an event to a group of Engines attached to the

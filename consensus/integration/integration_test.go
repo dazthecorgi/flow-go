@@ -2,16 +2,23 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"sort"
+
+	// "sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/onflow/flow-go/consensus/integration"
 	"github.com/onflow/flow-go/model/flow"
+
+	// "github.com/onflow/flow-go/model/messages"
 	"github.com/onflow/flow-go/module/irrecoverable"
 	"github.com/onflow/flow-go/module/util"
 	"github.com/onflow/flow-go/network/channels"
+	"github.com/onflow/flow-go/state/protocol"
 	"github.com/onflow/flow-go/utils/unittest"
 )
 
@@ -45,6 +52,87 @@ func stopNodes(t *testing.T, cancel context.CancelFunc, nodes []*Node) {
 		))
 	}
 	unittest.RequireCloseBefore(t, util.AllClosed(stoppingNodes...), time.Second, "requiring nodes to stop")
+}
+
+func TestTwinsScenario(t *testing.T) {
+	numIdentities := 4
+	participantsData := createConsensusIdentities(t, numIdentities)
+
+	// TODO vary root snapshot so that twins have different starting states
+	rootSnapshot := createRootSnapshot(t, participantsData)
+
+	// Extract node identities for leader selection
+	nodeIDs := make([]flow.Identifier, 0, len(participantsData.Participants))
+	for _, participant := range participantsData.Participants {
+		nodeIDs = append(nodeIDs, participant.NodeID)
+	}
+
+	// Create a custom leader selection factory
+	// This maps each view to a specific leader from the participants
+	customCommitteeFactory := func(state protocol.State, me flow.Identifier) (Committee, error) {
+		leadersByView := make(map[uint64]flow.Identifier)
+		for i := uint64(0); i < 1000; i++ { // Schedule leaders for first 10 views
+			// Always the byzantine nodes as leader
+			leadersByView[i] = nodeIDs[0]
+		}
+
+		// Override quorum threshold to 1
+		quorumThresholdOverride := func(view uint64) (uint64, bool, error) {
+			// Weight, not participants
+			return 1000, true, nil
+		}
+
+		custom, err := integration.NewTwinsConsensusCommittee(state, me, leadersByView, quorumThresholdOverride)
+		if err != nil {
+			return nil, err
+		}
+		return custom, nil
+	}
+
+	stopper := NewStopper(5, 0)
+
+	// First node is is duplicated for twins behavior
+	nodes, hub, runFor := createNodesWithCommitteeFactory(t, NewConsensusParticipants(participantsData), rootSnapshot, stopper, customCommitteeFactory)
+	require.Equal(t, numIdentities + 1, len(nodes))
+
+	// print node ids
+	for _, n := range nodes {
+		fmt.Printf("Node ID: %s\n", n.id.NodeID)
+	}
+
+	// Create a filter that tracks view height for consensus messages and applies partitions
+	partitionsFilter := func(channel channels.Channel, event interface{}, sender, receiver *Node) (bool, time.Duration) {
+		block := false
+		// First node which is byzantine, and the 2nd and 3rd nodes are one partition
+		if (sender.id.NodeID == nodeIDs[0] && !sender.isTwin) && !((receiver.id.NodeID == nodeIDs[0] && !receiver.isTwin) || receiver.id.NodeID == nodeIDs[1] || receiver.id.NodeID == nodeIDs[2]) {
+			block = true
+		}
+		if sender.id.NodeID == nodeIDs[1] && !((receiver.id.NodeID == nodeIDs[0] && !receiver.isTwin) || receiver.id.NodeID == nodeIDs[1] || receiver.id.NodeID == nodeIDs[2]) {
+			block = true
+		}
+		if sender.id.NodeID == nodeIDs[2] && !((receiver.id.NodeID == nodeIDs[0] && !receiver.isTwin) || receiver.id.NodeID == nodeIDs[1] || receiver.id.NodeID == nodeIDs[2]) {
+			block = true
+		}
+
+		// Twin byzantine node and the 4th node are another partition
+		if sender.isTwin && !(receiver.isTwin || receiver.id.NodeID == nodeIDs[3]) {
+			block = true
+		}
+		if sender.id.NodeID == nodeIDs[3] && !(receiver.isTwin || receiver.id.NodeID == nodeIDs[3]) {
+			block = true
+		}
+
+		return block, 0
+	}
+
+	hub.WithFilter(partitionsFilter)
+
+	runFor(30 * time.Second)
+
+	allViews := allFinalizedViews(t, nodes)
+	assertSafety(t, allViews)
+
+	cleanupNodes(nodes)
 }
 
 // happy path: with 3 nodes, they can reach consensus
@@ -96,6 +184,7 @@ func allFinalizedViews(t *testing.T, nodes []*Node) [][]uint64 {
 	// verify all nodes arrive at the same state
 	for _, node := range nodes {
 		views := chainViews(t, node)
+		fmt.Printf("chain length for node %x %t: %d\n", node.id.NodeID, node.isTwin, len(views))
 		allViews = append(allViews, views)
 	}
 

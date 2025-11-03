@@ -40,6 +40,7 @@ import (
 	builder "github.com/onflow/flow-go/module/builder/consensus"
 	synccore "github.com/onflow/flow-go/module/chainsync"
 	modulecompliance "github.com/onflow/flow-go/module/compliance"
+	"github.com/onflow/flow-go/module/component"
 	finalizer "github.com/onflow/flow-go/module/finalizer/consensus"
 	"github.com/onflow/flow-go/module/id"
 	"github.com/onflow/flow-go/module/irrecoverable"
@@ -137,6 +138,14 @@ func (p *ConsensusParticipants) Update(epochCounter uint64, data *run.Participan
 	}
 }
 
+// Committee combines all the interfaces a committee implementation must satisfy
+// for use in integration tests: consensus participation, epoch events, and lifecycle.
+type Committee interface {
+	hotstuff.DynamicCommittee
+	protocol.Consumer
+	component.Component
+}
+
 type Node struct {
 	db                fstorage.DB
 	dbCloser          io.Closer
@@ -147,13 +156,14 @@ type Node struct {
 	compliance        *compliance.Engine
 	sync              *synceng.Engine
 	hot               module.HotStuff
-	committee         *committees.Consensus
+	committee         Committee
 	voteAggregator    hotstuff.VoteAggregator
 	timeoutAggregator hotstuff.TimeoutAggregator
 	messageHub        *message_hub.MessageHub
 	state             *bprotocol.ParticipantState
 	headers           fstorage.Headers
 	net               *Network
+	isTwin			  bool
 }
 
 // epochInfo is a helper structure for storing epoch information such as counter and final view
@@ -184,6 +194,18 @@ func buildEpochLookupList(epochs ...protocol.CommittedEpoch) []epochInfo {
 // The list of created nodes, the common network hub, and a function which starts
 // all the nodes together, is returned.
 func createNodes(t *testing.T, participants *ConsensusParticipants, rootSnapshot protocol.Snapshot, stopper *Stopper) (nodes []*Node, hub *Hub, runFor func(time.Duration)) {
+	return createNodesWithCommitteeFactory(t, participants, rootSnapshot, stopper, nil)
+}
+
+// createNodesWithCommitteeFactory creates consensus nodes with a custom committee factory.
+// If committeeFactory is nil, the default committee factory is used for all nodes.
+func createNodesWithCommitteeFactory(
+	t *testing.T,
+	participants *ConsensusParticipants,
+	rootSnapshot protocol.Snapshot,
+	stopper *Stopper,
+	committeeFactory CommitteeFactory,
+) (nodes []*Node, hub *Hub, runFor func(time.Duration)) {
 	consensus, err := rootSnapshot.Identities(filter.HasRole[flow.Identity](flow.RoleConsensus))
 	require.NoError(t, err)
 
@@ -217,12 +239,23 @@ func createNodes(t *testing.T, participants *ConsensusParticipants, rootSnapshot
 		})
 
 	hub = NewNetworkHub(unittest.Logger())
-	nodes = make([]*Node, 0, len(consensus))
+	nodes = make([]*Node, 0, len(consensus) + 1)
+
+	// Use default factory if none provided
+	if committeeFactory == nil {
+		committeeFactory = DefaultCommitteeFactory()
+	}
+
 	for i, identity := range consensus {
 		consensusParticipant := participants.Lookup(identity.NodeID)
 		require.NotNil(t, consensusParticipant)
-		node := createNode(t, consensusParticipant, i, identity, rootSnapshot, hub, stopper, epochLookup)
+		node := createNode(t, consensusParticipant, i, identity, rootSnapshot, hub, stopper, epochLookup, committeeFactory, false)
 		nodes = append(nodes, node)
+		// Twin node
+		if i == 0 {
+			node := createNode(t, consensusParticipant, i, identity, rootSnapshot, hub, stopper, epochLookup, committeeFactory, true)
+			nodes = append(nodes, node)
+		}
 	}
 
 	// create a context which will be used for all nodes
@@ -370,6 +403,18 @@ func createRootSnapshot(t *testing.T, participantData *run.ParticipantData) *inm
 	return rootSnapshot
 }
 
+// CommitteeFactory is a function that creates a consensus committee for a node.
+// This allows tests to inject custom committee implementations (e.g., with custom leader selection).
+// The factory must return a Committee (which combines DynamicCommittee, Consumer, and Component interfaces).
+type CommitteeFactory func(state protocol.State, me flow.Identifier) (Committee, error)
+
+// DefaultCommitteeFactory creates a standard consensus committee.
+func DefaultCommitteeFactory() CommitteeFactory {
+	return func(state protocol.State, me flow.Identifier) (Committee, error) {
+		return committees.NewConsensusCommittee(state, me)
+	}
+}
+
 func createNode(
 	t *testing.T,
 	participant *ConsensusParticipant,
@@ -379,6 +424,8 @@ func createNode(
 	hub *Hub,
 	stopper *Stopper,
 	epochLookup module.EpochLookup,
+	committeeFactory CommitteeFactory,
+	isTwin bool,
 ) *Node {
 
 	pdb, dbDir := unittest.TempPebbleDB(t)
@@ -451,13 +498,14 @@ func createNode(
 		dbDir: dbDir,
 		index: index,
 		id:    identity,
+		isTwin: isTwin,
 	}
 
 	stopper.AddNode(node)
 
 	counterConsumer := &CounterConsumer{
 		finalized: func(total uint) {
-			stopper.onFinalizedTotal(node.id.NodeID, total)
+			stopper.onFinalizedTotal(node, total)
 		},
 	}
 
@@ -523,8 +571,14 @@ func createNode(
 	rootQC, err := rootSnapshot.QuorumCertificate()
 	require.NoError(t, err)
 
-	committee, err := committees.NewConsensusCommittee(state, localNodeID)
+	// Use the provided committee factory (allows for custom leader selection)
+	if committeeFactory == nil {
+		committeeFactory = DefaultCommitteeFactory()
+	}
+	committee, err := committeeFactory(state, localNodeID)
 	require.NoError(t, err)
+
+	// Committee implements protocol.Consumer for epoch events
 	protocolStateEvents.AddConsumer(committee)
 
 	// initialize the block finalizer
